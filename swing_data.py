@@ -1,4 +1,4 @@
-# !pip3 install scikit-learn pandas numpy matplotlib seaborn xgboost lightgbm imbalanced-learn
+# !pip3 install scikit-learn pandas numpy matplotlib seaborn xgboost lightgbm imbalanced-learn tensorflow tabulate
 import os
 import pandas as pd
 import numpy as np
@@ -31,46 +31,130 @@ def load_data():
     return train_df
 
 def create_features(df):
+    # First, ensure the dataframe is properly sorted for rolling calculations
+    df = df.sort_values(by=['uid', 'pitch_number']).copy()  # Add .copy() to avoid SettingWithCopyWarning
+    
     # Basic pitch movement features
+    print("Creating basic pitch features...")
     df['total_break'] = np.sqrt(df['pfx_x']**2 + df['pfx_z']**2)
     df['break_angle'] = np.arctan2(df['pfx_z'], df['pfx_x'])
     
     # Game situation features
+    print("Creating game situation features...")
     df['opposite_hand'] = df['is_lhp'] != df['is_lhb']
+    # Handle potential NaN values in base runners
+    df['on_1b'] = df['on_1b'].fillna(0)
+    df['on_2b'] = df['on_2b'].fillna(0)
+    df['on_3b'] = df['on_3b'].fillna(0)
     df['on_base'] = df['on_1b'] + df['on_2b'] + df['on_3b']
     df['late_game'] = df['inning'] >= 7
     df['pressure'] = (df['outs_when_up'] == 2) & ((df['on_2b'] == 1) | (df['on_3b'] == 1))
-    df['clutch'] = df['pressure'] & (df['late_game'] == 1)
+    df['clutch'] = df['pressure'] & df['late_game']
     
     # Pitcher state features
-    df['fatigue'] = df['pitch_number'] / 110
+    print("Creating pitcher state features...")
+    df['fatigue'] = df['pitch_number'].fillna(0) / 110  # Handle missing pitch numbers
     
     # Advanced physics features
+    print("Creating advanced physics features...")
     df['momentum_x'] = df['release_speed'] * df['release_pos_x']
     df['momentum_z'] = df['release_speed'] * df['release_pos_z']
     df['total_acceleration'] = np.sqrt(df['ax']**2 + df['ay']**2 + df['az']**2)
     df['pitch_break_horizontal'] = df['vx0'] - df['pfx_x']
     df['pitch_break_vertical'] = df['vz0'] - df['pfx_z']
     
-    # Rolling statistics
-    df = df.sort_values(by=['uid', 'pitch_number'])
-    df['avg_speed_last_5'] = df.groupby('uid')['release_speed'].rolling(window=5, min_periods=1).mean().reset_index(drop=True)
-    df['avg_speed_last_10'] = df.groupby('uid')['release_speed'].rolling(window=10, min_periods=1).mean().reset_index(drop=True)
-    df['avg_spin_last_5'] = df.groupby('uid')['release_spin_rate'].rolling(window=5, min_periods=1).mean().reset_index(drop=True)
-    df['avg_spin_last_10'] = df.groupby('uid')['release_spin_rate'].rolling(window=10, min_periods=1).mean().reset_index(drop=True)
+    # Rolling statistics with proper grouping and handling of edge cases
+    print("Creating rolling statistics...")
+    # Initialize rolling stat columns with zeros
+    rolling_columns = ['avg_speed_last_5', 'avg_speed_last_10', 
+                      'avg_spin_last_5', 'avg_spin_last_10']
+    for col in rolling_columns:
+        df[col] = 0.0
+    
+    # Calculate rolling stats for each pitcher (uid)
+    for uid in df['uid'].unique():
+        mask = df['uid'] == uid
+        if mask.sum() > 0:  # Only process if there are pitches for this uid
+            # Speed rolling averages
+            df.loc[mask, 'avg_speed_last_5'] = (
+                df.loc[mask, 'release_speed']
+                .rolling(window=5, min_periods=1)
+                .mean()
+                .fillna(df.loc[mask, 'release_speed'])
+            )
+            df.loc[mask, 'avg_speed_last_10'] = (
+                df.loc[mask, 'release_speed']
+                .rolling(window=10, min_periods=1)
+                .mean()
+                .fillna(df.loc[mask, 'release_speed'])
+            )
+            
+            # Spin rolling averages
+            df.loc[mask, 'avg_spin_last_5'] = (
+                df.loc[mask, 'release_spin_rate']
+                .rolling(window=5, min_periods=1)
+                .mean()
+                .fillna(df.loc[mask, 'release_spin_rate'])
+            )
+            df.loc[mask, 'avg_spin_last_10'] = (
+                df.loc[mask, 'release_spin_rate']
+                .rolling(window=10, min_periods=1)
+                .mean()
+                .fillna(df.loc[mask, 'release_spin_rate'])
+            )
     
     # Add interaction features
-    df['speed_spin_ratio'] = df['release_speed'] / df['release_spin_rate']
+    print("Creating interaction features...")
+    # Handle potential division by zero in speed_spin_ratio
+    df['speed_spin_ratio'] = np.where(
+        df['release_spin_rate'] > 0,
+        df['release_speed'] / df['release_spin_rate'],
+        0
+    )
     df['vertical_approach_angle'] = np.arctan2(df['vz0'], df['vx0'])
     
     # Add count features
+    print("Creating count features...")
     df['favorable_count'] = ((df['balls'] > df['strikes']) | 
                            ((df['balls'] == 3) & (df['strikes'] < 3)))
     
     # Add more advanced rolling stats
-    df['spin_efficiency'] = df['release_spin_rate'] / df.groupby('uid')['release_spin_rate'].transform('max')
-    df['pitch_tunneling'] = df.groupby('uid')['release_pos_x'].diff().abs() + df.groupby('uid')['release_pos_z'].diff().abs()
+    print("Creating advanced rolling stats...")
+    # Calculate spin efficiency safely
+    max_spin_by_uid = df.groupby('uid')['release_spin_rate'].transform('max')
+    df['spin_efficiency'] = np.where(
+        max_spin_by_uid > 0,
+        df['release_spin_rate'] / max_spin_by_uid,
+        0
+    )
     
+    # Calculate pitch tunneling
+    df['pitch_tunneling'] = (
+        df.groupby('uid')['release_pos_x'].diff().abs() +
+        df.groupby('uid')['release_pos_z'].diff().abs()
+    ).fillna(0)
+    
+    # Fill any remaining NaN values
+    print("Filling any remaining NaN values...")
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    df[numeric_columns] = df[numeric_columns].fillna(0)
+    
+    # Verify all features were created
+    expected_features = [
+        'total_break', 'break_angle', 'opposite_hand', 'on_base',
+        'late_game', 'pressure', 'clutch', 'fatigue', 'momentum_x',
+        'momentum_z', 'total_acceleration', 'pitch_break_horizontal',
+        'pitch_break_vertical', 'avg_speed_last_5', 'avg_speed_last_10',
+        'avg_spin_last_5', 'avg_spin_last_10', 'speed_spin_ratio',
+        'vertical_approach_angle', 'favorable_count', 'spin_efficiency',
+        'pitch_tunneling'
+    ]
+    
+    missing_features = set(expected_features) - set(df.columns)
+    if missing_features:
+        print(f"Warning: Missing features: {missing_features}")
+    
+    print("Feature creation complete.")
     return df
 
 def prepare_data(df):
@@ -140,6 +224,15 @@ def prepare_data(df):
     X = scaler.fit_transform(X)
     y = df['hit_type']
 
+    # Save the scaler
+    models_dir = 'models'
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    scaler_path = os.path.join(models_dir, f'scaler_{timestamp}.joblib')
+    dump(scaler, scaler_path)
+    print(f"Scaler saved to: {scaler_path}")
+
     # Encode the target variable before SMOTE
     le = LabelEncoder()
     y = le.fit_transform(y)
@@ -163,7 +256,7 @@ def prepare_data(df):
 
     return X_selected, y_resampled, selected_features, le_dict['hit_type'], scaler, feature_groups, class_weights
 
-def train_model(X_train, y_train, X_test, y_test, features, feature_groups=None, class_weights=None):
+def train_model(X_train, y_train, X_test, y_test, features, feature_groups=None, class_weights=None, scaler=None):
 
     
     print("\n========== MODEL TRAINING DETAILS ==========")
@@ -364,6 +457,12 @@ def train_model(X_train, y_train, X_test, y_test, features, feature_groups=None,
     dump(features, feature_path)
     print(f"Features saved to: {feature_path}")
     
+    # Only save scaler if it was provided
+    if scaler is not None:
+        scaler_path = os.path.join(models_dir, f'scaler_{timestamp}.joblib')
+        dump(scaler, scaler_path)
+        print(f"Scaler saved to: {scaler_path}")
+    
     return model
 
 def predict_and_save(model, X_test, test_df_uids, output_file):
@@ -472,16 +571,20 @@ def main():
     
     # Train the model
     print("\nTraining model...")
-    model = train_model(X_train, y_train, X_test, y_test, features, feature_groups, class_weights)
+    model = train_model(X_train, y_train, X_test, y_test, features, feature_groups, class_weights, scaler)
     
     # Load and process test data
     print("\nLoading test data...")
     test_df = pd.read_csv('test.csv')
+    test_df = create_features(test_df)  # Create features for test data
+    
+    # Process test data using the same preparation steps
+    X_test_final = scaler.transform(test_df[features])  # Use the same features and scaler from training
     
     try:
-        # Make predictions and save to CSV
+        # Make predictions using the properly processed test data
         print("\nMaking predictions...")
-        predictions = predict_and_save(model, X_test, test_df['uid'], 'predictions.csv')
+        predictions = predict_and_save(model, X_test_final, test_df['uid'], 'predictions.csv')
         
         # Print feature importance
         feature_importance = pd.DataFrame({
@@ -522,5 +625,58 @@ def main():
     except Exception as e:
         print(f"\nError saving model: {str(e)}")
 
+def run_prediction():
+    # Find the latest model
+    print("\nFinding latest model...")
+    models_dir = 'models'
+    model_files = [f for f in os.listdir(models_dir) if f.startswith('random_forest_model_')]
+    if not model_files:
+        raise Exception("No model files found in models directory")
+    
+    latest_model_file = max(model_files)
+    timestamp = latest_model_file.split('random_forest_model_')[1].split('.')[0]
+    
+    # Load the latest model and associated files
+    print(f"\nLoading model and data from timestamp: {timestamp}")
+    model = load(os.path.join(models_dir, latest_model_file))
+    features = load(os.path.join(models_dir, f'features_{timestamp}.joblib'))
+    
+    # Find the latest scaler file instead of assuming timestamp
+    scaler_files = [f for f in os.listdir(models_dir) if f.startswith('scaler_')]
+    if not scaler_files:
+        raise Exception("No scaler files found in models directory")
+    latest_scaler_file = max(scaler_files)
+    scaler = load(os.path.join(models_dir, latest_scaler_file))
+    
+    # Load and process test data
+    print("\nLoading and processing test data...")
+    test_df = pd.read_csv('test.csv')
+    test_df = create_features(test_df)  # Make sure all necessary features are created
+    
+    # Ensure all features are present and in the correct order
+    missing_features = set(features) - set(test_df.columns)
+    if missing_features:
+        print(f"Warning: Adding missing features: {missing_features}")
+        for feature in missing_features:
+            test_df[feature] = 0  # Initialize missing features with 0
+    
+    # Create X_test with features in the same order as during training
+    X_test = test_df[features].copy()  # Use .copy() to avoid SettingWithCopyWarning
+    
+    # Scale the features
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Run prediction
+    print("\nMaking predictions...")
+    timestamp_now = datetime.now().strftime('%Y%m%d_%H%M%S')
+    predictions_file = f'predictions_{timestamp_now}.csv'
+    predictions = predict_and_save(model, X_test_scaled, test_df['uid'], predictions_file)
+    print(f"\nPredictions saved to {predictions_file}")
+    
+    return predictions
+
 if __name__ == "__main__":
-    main()
+    prepare_data()
+
+# if __name__ == "__main__":
+#     main()
