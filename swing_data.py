@@ -1,3 +1,5 @@
+# !pip3 install scikit-learn pandas numpy matplotlib seaborn xgboost lightgbm imbalanced-learn
+import os
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -17,8 +19,11 @@ from imblearn.over_sampling import SMOTE
 from sklearn.feature_selection import SelectFromModel
 from sklearn.ensemble import StackingClassifier
 from sklearn.linear_model import LogisticRegression
-import os
 from datetime import datetime
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+import tensorflow as tf
+from joblib import dump, load
 
 # Load the data
 def load_data():
@@ -112,50 +117,54 @@ def prepare_data(df):
     }
     
     # Create target variable
-    hit_outcomes = ['single', 'double', 'triple', 'home_run']
+    hit_outcomes = ['out','single', 'double', 'triple', 'home_run']
     df['hit_type'] = df['outcome']
-    df.loc[~df['outcome'].isin(hit_outcomes), 'hit_type'] = 'other'
     
-    # Encode categorical variables
-    categorical_cols = ['is_lhp', 'is_lhb', 'pitch_type', 'hit_type']
+    # Before scaling, separate numeric and categorical features
+    categorical_features = ['pitch_type', 'pitch_name']  # Add any other categorical columns
+    numeric_features = [f for f in all_features if f not in categorical_features]
+    
+    # Encode categorical features
     le_dict = {}
-    for col in categorical_cols:
-        le_dict[col] = LabelEncoder()
-        df[col] = le_dict[col].fit_transform(df[col].astype(str))
+    for cat_feature in categorical_features:
+        if cat_feature in all_features:
+            le = LabelEncoder()
+            df[f'{cat_feature}_encoded'] = le.fit_transform(df[cat_feature])
+            le_dict[cat_feature] = le
+            # Replace the categorical feature with its encoded version in the features list
+            all_features[all_features.index(cat_feature)] = f'{cat_feature}_encoded'
     
-    # Combine all features
-    features = []
-    for group in feature_groups.values():
-        features.extend(group)
-    features = list(set(features))  # Remove any duplicates
-    
-    # Handle missing values
-    df[features] = df[features].fillna(df[features].mean())
-
-    # Scale features
+    # Now scale only numeric features
     scaler = StandardScaler()
-    X = scaler.fit_transform(df[features])
+    X = df[all_features].copy()  # Use all features (now with encoded categoricals)
+    X = scaler.fit_transform(X)
     y = df['hit_type']
+
+    # Encode the target variable before SMOTE
+    le = LabelEncoder()
+    y = le.fit_transform(y)
+    le_dict['hit_type'] = le
 
     # SMOTE for handling class imbalance
     smote = SMOTE(random_state=42)
     X_resampled, y_resampled = smote.fit_resample(X, y)
 
-    # Feature selection using LASSO
-    selector = SelectFromModel(Lasso(alpha=0.01))
+    # Feature selection using Random Forest instead of Lasso
+    selector = SelectFromModel(RandomForestClassifier(n_estimators=100, random_state=42))
     X_selected = selector.fit_transform(X_resampled, y_resampled)
-    selected_features = [features[i] for i in range(len(features)) 
+    selected_features = [all_features[i] for i in range(len(all_features)) 
                         if selector.get_support()[i]]
 
-    return X_selected, y_resampled, selected_features, le_dict['hit_type'], scaler, feature_groups
+    # Calculate class weights
+    class_weights = dict(zip(
+        np.unique(y_resampled),
+        len(y_resampled) / (len(np.unique(y_resampled)) * np.bincount(y_resampled))
+    ))
 
-def train_model(X_train, y_train, X_test, y_test, features, feature_groups=None):
-    from sklearn.ensemble import RandomForestClassifier
-    from collections import Counter
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    from sklearn.metrics import confusion_matrix, roc_curve, auc
-    from sklearn.model_selection import cross_val_score
+    return X_selected, y_resampled, selected_features, le_dict['hit_type'], scaler, feature_groups, class_weights
+
+def train_model(X_train, y_train, X_test, y_test, features, feature_groups=None, class_weights=None):
+
     
     print("\n========== MODEL TRAINING DETAILS ==========")
     
@@ -244,11 +253,6 @@ def train_model(X_train, y_train, X_test, y_test, features, feature_groups=None)
 
     # Ensure feature importances match feature count
     feature_importance = feature_importance.iloc[:len(features)]
-
-    feature_importance = pd.DataFrame({
-        'feature': features,
-        'importance': model.feature_importances_
-    }).sort_values('importance', ascending=False)
     
     print("\nTop 15 Most Important Features:")
     print(feature_importance.head(15))
@@ -340,35 +344,40 @@ def train_model(X_train, y_train, X_test, y_test, features, feature_groups=None)
     plt.savefig(os.path.join(plots_dir, 'precision_recall_curve.png'))
     plt.close()
     
+    print("\n========== SAVING MODEL ==========")
+    
+    # Create models directory if it doesn't exist
+    models_dir = 'models'
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
+    
+    # Add timestamp to model files
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # Save the model and its components
+    model_path = os.path.join(models_dir, f'random_forest_model_{timestamp}.joblib')
+    dump(model, model_path)
+    print(f"Model saved to: {model_path}")
+    
+    # Save feature names
+    feature_path = os.path.join(models_dir, f'features_{timestamp}.joblib')
+    dump(features, feature_path)
+    print(f"Features saved to: {feature_path}")
+    
     return model
 
-def predict_and_save(model, test_df, features, scaler, output_file):
-    # Create features first
-    test_df = create_features(test_df)
+def predict_and_save(model, X_test, test_df_uids, output_file):
+    # Find the latest model file
+    models_dir = 'models'
+    model_files = [f for f in os.listdir(models_dir) if f.startswith('random_forest_model_')]
+    if model_files:
+        latest_model_file = max(model_files)  # Gets the most recent timestamp
+        model_path = os.path.join(models_dir, latest_model_file)
+        print(f"\nLoading latest model from: {model_path}")
+        model = load(model_path)
+    else:
+        print("\nNo saved model found, using provided model")
 
-    # Check for missing features and handle them
-    missing_features = [f for f in features if f not in test_df.columns]
-    if missing_features:
-        print(f"Warning: Missing features in test data: {missing_features}")
-        # You can choose to:
-        # 1. Raise an error: raise ValueError(f"Missing required features: {missing_features}")
-        # 2. Impute missing values: test_df[missing_features] = test_df[missing_features].fillna(test_df[missing_features].mean())
-        # 3. Exclude samples with missing features: test_df = test_df.dropna(subset=missing_features)
-
-    # Encode categorical columns using the same LabelEncoder as in training
-    categorical_cols = ['is_lhp', 'is_lhb', 'pitch_type']
-    for col in categorical_cols:
-        if col in features:
-            le = le_dict[col]  # Use the same LabelEncoder
-            test_df[col] = le.transform(test_df[col].astype(str))
-
-    # Handle missing values (if not handled above)
-    test_df[features] = test_df[features].fillna(test_df[features].mean())
-
-    # Scale features
-    X_test = scaler.transform(test_df[features])
-    
-    # Get probability predictions
     probabilities = model.predict_proba(X_test)
     
     # Create predictions directory if it doesn't exist
@@ -383,7 +392,7 @@ def predict_and_save(model, test_df, features, scaler, output_file):
     
     # Create DataFrame with predictions
     predictions_df = pd.DataFrame({
-        'uid': test_df['uid'],
+        'uid': test_df_uids,
         'out': probabilities[:, 0],
         'single': probabilities[:, 1],
         'double': probabilities[:, 2],
@@ -420,11 +429,40 @@ def create_ensemble_model():
     return stacking
 
 def main():
-    # Load and prepare training data
+    print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
+
+    # Assuming you have at least one GPU:
+    gpu_device = tf.config.list_physical_devices('GPU')[0]
+    tf.config.experimental.set_memory_growth(gpu_device, True) 
+    
+    # Fix: Add quotes around file paths
+    train_df = pd.read_csv('train.csv')
+    test_df = pd.read_csv('test.csv')
+    sample_submission_df = pd.read_csv('sample_submission.csv')
+    
+    # Display the first 5 rows of each DataFrame
+    print("First 5 rows of train_df:")
+    print(train_df.head().to_markdown(index=False, numalign="left", stralign="left"))
+
+    print("\nFirst 5 rows of test_df:")
+    print(test_df.head().to_markdown(index=False, numalign="left", stralign="left"))
+
+    print("\nFirst 5 rows of sample_submission_df:")
+    print(sample_submission_df.head().to_markdown(index=False, numalign="left", stralign="left"))
+
+    # Print the column names and their data types for each DataFrame
+    print("\nColumn names and their data types for train_df:")
+    print(train_df.info())
+
+    print("\nColumn names and their data types for test_df:")
+    print(test_df.info())
+
+    print("\nColumn names and their data types for sample_submission_df:")
+    print(sample_submission_df.info())
     print("Loading and preparing training data...")
     df = load_data()
     df = create_features(df)
-    X, y, features, label_encoder, scaler, feature_groups = prepare_data(df)
+    X, y, features, label_encoder, scaler, feature_groups, class_weights = prepare_data(df)
     
     # Split the data
     print("\nSplitting data...")
@@ -434,7 +472,7 @@ def main():
     
     # Train the model
     print("\nTraining model...")
-    model = train_model(X_train, y_train, X_test, y_test, features, feature_groups)
+    model = train_model(X_train, y_train, X_test, y_test, features, feature_groups, class_weights)
     
     # Load and process test data
     print("\nLoading test data...")
@@ -443,7 +481,7 @@ def main():
     try:
         # Make predictions and save to CSV
         print("\nMaking predictions...")
-        predictions = predict_and_save(model, test_df, features, scaler, 'predictions.csv')
+        predictions = predict_and_save(model, X_test, test_df['uid'], 'predictions.csv')
         
         # Print feature importance
         feature_importance = pd.DataFrame({
@@ -462,6 +500,27 @@ def main():
     except Exception as e:
         print(f"\nError during prediction: {str(e)}")
         print("Please ensure all required features are present in the test data.")
+
+    # After model training, add:
+    try:
+        # Create a dictionary with model metadata
+        model_metadata = {
+            'training_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'num_features': len(features),
+            'num_classes': len(np.unique(y)),
+            'feature_groups': feature_groups,
+            'class_weights': class_weights
+        }
+        
+        # Save metadata
+        models_dir = 'models'
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        metadata_path = os.path.join(models_dir, f'model_metadata_{timestamp}.joblib')
+        dump(model_metadata, metadata_path)
+        print(f"Model metadata saved to: {metadata_path}")
+        
+    except Exception as e:
+        print(f"\nError saving model: {str(e)}")
 
 if __name__ == "__main__":
     main()
