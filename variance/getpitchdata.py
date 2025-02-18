@@ -58,5 +58,5 @@ def get_pitch_data_for_year(year):
 
 if __name__ == "__main__":
     # Example usage
-    year = 2024  # Change this to the desired year
+    year = 2023  # Change this to the desired year
     get_pitch_data_for_year(year)
